@@ -1,0 +1,178 @@
+name: Site Security Audit
+
+on:
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y nmap jq curl openssl
+
+      - name: Install Nuclei
+        run: |
+          go install github.com/projectdiscovery/nuclei/v3/cmd/nuclei@v3.4.10
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+
+      - name: Collect passive and low-impact checks
+        shell: bash
+        run: |
+          set -u
+          mkdir -p reports
+          targets=(
+            "new|antiborschevik.simargl-team.ru|https://antiborschevik.simargl-team.ru/"
+            "old|antiborschevik.info|https://antiborschevik.info/map"
+          )
+
+          for entry in "${targets[@]}"; do
+            name="${entry%%|*}"
+            rest="${entry#*|}"
+            host="${rest%%|*}"
+            url="${rest#*|}"
+
+            {
+              echo "Target: $url"
+              echo
+              echo "== HEADERS =="
+              curl -ksS -L -D - -o /dev/null --max-time 30 "$url"
+              echo
+              echo "== CORS GET WITH FOREIGN ORIGIN =="
+              curl -ksS -L -D - -o /dev/null --max-time 30 \
+                -H 'Origin: https://attacker.invalid' "$url"
+              echo
+              echo "== CORS PREFLIGHT =="
+              curl -ksS -X OPTIONS -D - -o /dev/null --max-time 30 \
+                -H 'Origin: https://attacker.invalid' \
+                -H 'Access-Control-Request-Method: GET' \
+                -H 'Access-Control-Request-Headers: authorization,content-type' \
+                "$url"
+            } > "reports/http-${name}.txt" 2>&1 || true
+
+            {
+              echo | openssl s_client -connect "${host}:443" -servername "$host" -showcerts 2>/dev/null \
+                | openssl x509 -noout -subject -issuer -serial -dates -fingerprint -sha256
+            } > "reports/certificate-${name}.txt" 2>&1 || true
+
+            for path in /.well-known/security.txt /security.txt /robots.txt /sitemap.xml; do
+              safe_path=$(echo "$path" | tr '/.' '__')
+              curl -ksS -L -D "reports/${name}-${safe_path}-headers.txt" \
+                -o "reports/${name}-${safe_path}-body.txt" \
+                --max-time 30 "https://${host}${path}" || true
+            done
+
+            nmap -Pn -sV -p 80,443 \
+              --script http-title,http-security-headers,ssl-cert,ssl-enum-ciphers \
+              --script-timeout 60s --host-timeout 5m \
+              -oA "reports/nmap-${name}" "$host" || true
+          done
+
+      - name: Run Nuclei safe configuration checks
+        shell: bash
+        run: |
+          set -u
+          nuclei -update-templates -silent || true
+          for entry in \
+            'new|https://antiborschevik.simargl-team.ru/' \
+            'old|https://antiborschevik.info/map'; do
+            name="${entry%%|*}"
+            url="${entry#*|}"
+            nuclei -u "$url" \
+              -severity info,low,medium,high,critical \
+              -tags tech,ssl,misconfig,exposure \
+              -exclude-tags dos,fuzz,bruteforce,intrusive,headless \
+              -no-interactsh -rate-limit 15 -concurrency 5 -bulk-size 5 \
+              -timeout 10 -retries 1 -jsonl \
+              -o "reports/nuclei-${name}.jsonl" || true
+          done
+
+      - name: Run OWASP ZAP baseline scans
+        shell: bash
+        run: |
+          set -u
+          chmod -R 777 reports
+          docker run --rm -v "$PWD/reports:/zap/wrk/:rw" \
+            ghcr.io/zaproxy/zaproxy:stable \
+            zap-baseline.py -t 'https://antiborschevik.simargl-team.ru/' \
+            -m 3 -I -J zap-new.json -r zap-new.html -w zap-new.md || true
+          docker run --rm -v "$PWD/reports:/zap/wrk/:rw" \
+            ghcr.io/zaproxy/zaproxy:stable \
+            zap-baseline.py -t 'https://antiborschevik.info/map' \
+            -m 3 -I -J zap-old.json -r zap-old.html -w zap-old.md || true
+
+      - name: Build compact summary
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json, pathlib, re
+          root = pathlib.Path('reports')
+          summary = {'targets': {}}
+          for name in ('new','old'):
+              item = {'nuclei': [], 'zap': {}, 'headers': {}}
+              nf = root / f'nuclei-{name}.jsonl'
+              if nf.exists():
+                  for line in nf.read_text(errors='ignore').splitlines():
+                      try:
+                          j = json.loads(line)
+                      except Exception:
+                          continue
+                      info = j.get('info') or {}
+                      item['nuclei'].append({
+                          'template_id': j.get('template-id'),
+                          'name': info.get('name'),
+                          'severity': info.get('severity'),
+                          'matched_at': j.get('matched-at'),
+                          'type': j.get('type'),
+                      })
+              zf = root / f'zap-{name}.json'
+              if zf.exists():
+                  try:
+                      z = json.loads(zf.read_text(errors='ignore'))
+                      counts = {}
+                      alerts = []
+                      for site in z.get('site', []):
+                          for a in site.get('alerts', []):
+                              risk = str(a.get('riskdesc','Unknown')).split(' ')[0]
+                              counts[risk] = counts.get(risk, 0) + 1
+                              alerts.append({
+                                  'name': a.get('name'),
+                                  'risk': a.get('riskdesc'),
+                                  'confidence': a.get('confidence'),
+                                  'count': a.get('count'),
+                                  'solution': a.get('solution'),
+                              })
+                      item['zap'] = {'counts': counts, 'alerts': alerts}
+                  except Exception as e:
+                      item['zap'] = {'error': str(e)}
+              hf = root / f'http-{name}.txt'
+              text = hf.read_text(errors='ignore') if hf.exists() else ''
+              keys = [
+                  'strict-transport-security','content-security-policy',
+                  'x-content-type-options','x-frame-options','referrer-policy',
+                  'permissions-policy','cross-origin-opener-policy',
+                  'cross-origin-resource-policy','access-control-allow-origin',
+                  'access-control-allow-credentials','server','set-cookie'
+              ]
+              for key in keys:
+                  vals = re.findall(rf'(?im)^{re.escape(key)}:\s*(.+)$', text)
+                  item['headers'][key] = vals
+              summary['targets'][name] = item
+          (root / 'summary.json').write_text(json.dumps(summary, ensure_ascii=False, indent=2))
+          print(json.dumps(summary, ensure_ascii=False, indent=2))
+          PY
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: site-security-audit
+          path: reports
+          retention-days: 3
