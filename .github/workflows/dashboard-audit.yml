@@ -4,6 +4,9 @@ on:
   push:
     branches:
       - chatgpt-dashboard-audit
+  pull_request:
+    branches:
+      - main
 
 jobs:
   inspect-dashboard:
