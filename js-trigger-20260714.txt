@@ -1,0 +1,1 @@
+Trigger current map JavaScript capture.
