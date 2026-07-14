@@ -9,12 +9,12 @@ on:
       - main
 
 jobs:
-  compare-chemistry-labs:
+  deep-chemistry-lab-audit:
     runs-on: ubuntu-latest
     timeout-minutes: 20
 
     steps:
-      - name: Install browser tooling
+      - name: Install Playwright
         shell: bash
         run: |
           set -euxo pipefail
@@ -22,100 +22,125 @@ jobs:
           npm install playwright
           npx playwright install --with-deps chromium
 
-      - name: Inspect all three platforms
+      - name: Inspect interactive screens
         shell: bash
         run: |
           set -euxo pipefail
-          mkdir -p comparison
+          mkdir -p deep-audit
           cat > inspect.mjs <<'EOF'
           import { chromium } from 'playwright';
           import fs from 'node:fs';
 
-          const targets = [
-            { key: 'chemforge', url: 'http://62.109.4.219:3000/dashboard' },
-            { key: 'chemcollective-list', url: 'https://chemcollective.org/vlabs' },
-            { key: 'chemcollective-lab', url: 'https://chemcollective.org/activities/vlab/2' },
-            { key: 'chemverse', url: 'https://chemverse.vercel.app/' }
-          ];
-
           const browser = await chromium.launch({ headless: true });
+          const safe = async (fn, fallback = null) => { try { return await fn(); } catch { return fallback; } };
 
-          for (const target of targets) {
-            const context = await browser.newContext({
-              viewport: { width: 1440, height: 1000 },
-              ignoreHTTPSErrors: true
-            });
-            const page = await context.newPage();
-            const events = [];
-
-            page.on('console', msg => events.push(`[console:${msg.type()}] ${msg.text()}`));
-            page.on('pageerror', err => events.push(`[pageerror] ${err.message}`));
-            page.on('requestfailed', req => events.push(`[requestfailed] ${req.failure()?.errorText} ${req.url()}`));
-            page.on('response', response => {
-              if (response.status() >= 400) events.push(`[response] ${response.status()} ${response.url()}`);
-            });
-
-            let navigationError = null;
-            try {
-              await page.goto(target.url, { waitUntil: 'domcontentloaded', timeout: 90000 });
-              await page.waitForLoadState('networkidle', { timeout: 30000 }).catch(() => {});
-              await page.waitForTimeout(3000);
-            } catch (error) {
-              navigationError = String(error);
-            }
-
-            const safe = async (fn, fallback) => {
-              try { return await fn(); } catch { return fallback; }
-            };
-
-            const metadata = {
-              requestedUrl: target.url,
-              finalUrl: page.url(),
+          async function snapshot(page, key, root = page) {
+            const dir = `deep-audit/${key}`;
+            fs.mkdirSync(dir, { recursive: true });
+            const data = {
+              url: page.url(),
               title: await safe(() => page.title(), ''),
-              navigationError,
-              bodyText: await safe(() => page.locator('body').innerText(), ''),
-              headings: await safe(() => page.locator('h1,h2,h3').allInnerTexts(), []),
-              buttons: await safe(() => page.locator('button,[role="button"]').evaluateAll(nodes => nodes.map(n => ({
-                text: (n.innerText || n.textContent || '').trim(),
+              text: await safe(() => root.locator('body').innerText(), ''),
+              headings: await safe(() => root.locator('h1,h2,h3,h4').allInnerTexts(), []),
+              buttons: await safe(() => root.locator('button,[role="button"],input[type="button"],input[type="submit"]').evaluateAll(nodes => nodes.map((n, index) => ({
+                index,
+                text: (n.innerText || n.value || n.textContent || '').trim(),
                 ariaLabel: n.getAttribute('aria-label'),
                 title: n.getAttribute('title'),
-                disabled: n.hasAttribute('disabled')
-              })).filter(x => x.text || x.ariaLabel || x.title)), []),
-              links: await safe(() => page.locator('a').evaluateAll(nodes => nodes.map(n => ({
-                text: (n.innerText || n.textContent || '').trim(),
-                href: n.href
-              })).filter(x => x.text || x.href)), []),
-              inputs: await safe(() => page.locator('input,select,textarea').evaluateAll(nodes => nodes.map(n => ({
+                className: n.className
+              }))), []),
+              controls: await safe(() => root.locator('input,select,textarea').evaluateAll(nodes => nodes.map((n, index) => ({
+                index,
                 tag: n.tagName,
                 type: n.getAttribute('type'),
                 name: n.getAttribute('name'),
+                value: n.value,
                 placeholder: n.getAttribute('placeholder'),
                 ariaLabel: n.getAttribute('aria-label')
               }))), []),
-              frames: page.frames().map(frame => ({ name: frame.name(), url: frame.url() })),
-              localStorage: await safe(() => page.evaluate(() => Object.fromEntries(Object.entries(localStorage))), {}),
-              sessionStorage: await safe(() => page.evaluate(() => Object.fromEntries(Object.entries(sessionStorage))), {})
+              links: await safe(() => root.locator('a').evaluateAll(nodes => nodes.map(n => ({
+                text: (n.innerText || n.textContent || '').trim(), href: n.href, title: n.title
+              }))), []),
+              html: await safe(() => root.locator('body').innerHTML(), '')
             };
+            fs.writeFileSync(`${dir}/metadata.json`, JSON.stringify(data, null, 2));
+            fs.writeFileSync(`${dir}/body.txt`, data.text || '');
+            fs.writeFileSync(`${dir}/body.html`, data.html || '');
+            await safe(() => page.screenshot({ path: `${dir}/screenshot.png`, fullPage: true }));
+            console.log(`=== ${key} ===`);
+            console.log(JSON.stringify({ ...data, html: undefined, text: (data.text || '').slice(0, 16000) }, null, 2));
+          }
 
-            fs.mkdirSync(`comparison/${target.key}`, { recursive: true });
-            fs.writeFileSync(`comparison/${target.key}/metadata.json`, JSON.stringify(metadata, null, 2));
-            fs.writeFileSync(`comparison/${target.key}/body.txt`, metadata.bodyText);
-            fs.writeFileSync(`comparison/${target.key}/events.txt`, events.join('\n'));
-            fs.writeFileSync(`comparison/${target.key}/page.html`, await safe(() => page.content(), ''));
-            await safe(() => page.screenshot({ path: `comparison/${target.key}/screenshot.png`, fullPage: true }), null);
+          // ChemVerse section screens.
+          {
+            const context = await browser.newContext({ viewport: { width: 1440, height: 1000 } });
+            const page = await context.newPage();
+            const sections = [
+              ['chemverse-safety', /Lab Safety Training/i],
+              ['chemverse-apparatus', /Apparatus Room/i],
+              ['chemverse-experiments', /Experiment Labs/i],
+              ['chemverse-achievements', /Achievements/i]
+            ];
 
-            console.log(`=== ${target.key} ===`);
-            console.log(JSON.stringify({
-              title: metadata.title,
-              finalUrl: metadata.finalUrl,
-              headings: metadata.headings,
-              buttons: metadata.buttons.slice(0, 80),
-              links: metadata.links.slice(0, 80),
-              inputs: metadata.inputs,
-              frames: metadata.frames,
-              bodyPreview: metadata.bodyText.slice(0, 12000)
-            }, null, 2));
+            for (const [key, name] of sections) {
+              await page.goto('https://chemverse.vercel.app/', { waitUntil: 'networkidle', timeout: 90000 });
+              await page.getByRole('button', { name }).click();
+              await page.waitForTimeout(1800);
+              await snapshot(page, key);
 
+              if (key === 'chemverse-experiments') {
+                const buttons = page.locator('button');
+                const texts = await buttons.allInnerTexts();
+                const index = texts.findIndex(t => {
+                  const x = t.trim();
+                  return x.length > 25 && !/back|settings|filter|level|difficulty/i.test(x);
+                });
+                if (index >= 0) {
+                  await buttons.nth(index).click();
+                  await page.waitForTimeout(1800);
+                  await snapshot(page, 'chemverse-first-experiment');
+                }
+              }
+            }
+            await context.close();
+          }
+
+          // ChemCollective actual lab iframe.
+          {
+            const context = await browser.newContext({ viewport: { width: 1440, height: 1100 }, ignoreHTTPSErrors: true });
+            const page = await context.newPage();
+            await page.goto('https://chemcollective.org/activities/vlab/2', { waitUntil: 'domcontentloaded', timeout: 90000 });
+            await page.waitForTimeout(7000);
+            const frame = page.frame({ name: 'labframe' });
+            if (!frame) throw new Error('ChemCollective labframe not found');
+
+            await snapshot(page, 'chemcollective-before-tip-close', frame);
+
+            for (let i = 0; i < 4; i++) {
+              const close = frame.locator('.close, button:has-text("Close"), button:has-text("×"), [aria-label="Close"]');
+              if (await close.count()) {
+                await close.first().click({ force: true }).catch(() => {});
+                await frame.waitForTimeout(300);
+              }
+              const next = frame.getByRole('button', { name: /Next Tip/i });
+              if (await next.count()) {
+                await next.first().click({ force: true }).catch(() => {});
+                await frame.waitForTimeout(300);
+              }
+            }
+
+            await snapshot(page, 'chemcollective-lab-open', frame);
+
+            const menuNames = ['File', 'Edit', 'View', 'Help'];
+            for (const name of menuNames) {
+              const menu = frame.getByText(name, { exact: true });
+              if (await menu.count()) {
+                await menu.first().click({ force: true }).catch(() => {});
+                await frame.waitForTimeout(300);
+                await snapshot(page, `chemcollective-menu-${name.toLowerCase()}`, frame);
+                await page.keyboard.press('Escape').catch(() => {});
+              }
+            }
             await context.close();
           }
 
@@ -123,10 +148,10 @@ jobs:
           EOF
           node inspect.mjs
 
-      - name: Upload comparison artifact
+      - name: Upload deep audit artifact
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: chemistry-platform-comparison
-          path: comparison/
+          name: chemistry-platform-deep-audit
+          path: deep-audit/
           if-no-files-found: warn
