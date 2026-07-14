@@ -1,0 +1,185 @@
+name: Bounded Full Map Audit Fallback
+
+on:
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    env:
+      TARGET_URL: https://antiborschevik.simargl-team.ru
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq curl openssl
+          npm install -g lighthouse@13
+          npm install playwright@1.53.2
+          npx playwright install --with-deps chromium
+          mkdir -p reports/lighthouse reports/playwright reports/network reports/security
+
+      - name: Network and TLS
+        shell: bash
+        run: |
+          set -u
+          echo 'run,http_code,dns,tcp,tls,ttfb,total,size_download,speed_download' > reports/network/curl.csv
+          for run in $(seq 1 15); do
+            curl -L -sS -o /dev/null --max-time 45 \
+              -w "$run,%{http_code},%{time_namelookup},%{time_connect},%{time_appconnect},%{time_starttransfer},%{time_total},%{size_download},%{speed_download}\n" \
+              "$TARGET_URL" >> reports/network/curl.csv || true
+          done
+          curl -sSIL --max-time 30 "$TARGET_URL" > reports/network/headers.txt || true
+          curl -sS -D reports/network/cors-options.txt -o /dev/null -X OPTIONS \
+            -H 'Origin: https://security-audit.invalid' \
+            -H 'Access-Control-Request-Method: GET' "$TARGET_URL" || true
+          host=$(echo "$TARGET_URL" | sed -E 's#https?://([^/]+).*#\1#')
+          echo | openssl s_client -connect "$host:443" -servername "$host" -showcerts \
+            > reports/network/tls.txt 2>&1 || true
+
+      - name: Lighthouse repeated runs
+        shell: bash
+        run: |
+          set -u
+          for mode in mobile desktop; do
+            for run in 1 2 3; do
+              args=(
+                "$TARGET_URL"
+                --output=json
+                --output-path="reports/lighthouse/${mode}-${run}.json"
+                --only-categories=performance
+                --chrome-flags="--headless --no-sandbox --disable-dev-shm-usage --enable-precise-memory-info"
+                --quiet
+              )
+              if [ "$mode" = desktop ]; then args+=(--preset=desktop); fi
+              lighthouse "${args[@]}" || true
+            done
+          done
+
+      - name: Playwright real map interaction
+        shell: bash
+        run: |
+          cat > audit.mjs <<'EOF'
+          import { chromium, devices } from 'playwright';
+          import fs from 'node:fs';
+          const url=process.env.TARGET_URL;
+          const output=[];
+          const browser=await chromium.launch({headless:true,args:['--no-sandbox','--enable-precise-memory-info']});
+          const profiles=[
+            {name:'desktop',context:{viewport:{width:1440,height:900}},cpu:1,network:null},
+            {name:'mobile-4g',context:{...devices['Pixel 7']},cpu:4,network:{offline:false,latency:80,downloadThroughput:1.6*1024*1024/8,uploadThroughput:750*1024/8}},
+            {name:'mobile-slow4g',context:{...devices['Moto G4']},cpu:6,network:{offline:false,latency:150,downloadThroughput:750*1024/8,uploadThroughput:250*1024/8}},
+          ];
+          for(const p of profiles){
+            for(let run=1;run<=2;run++){
+              const context=await browser.newContext(p.context);
+              const page=await context.newPage();
+              const cdp=await context.newCDPSession(page);
+              if(p.cpu>1) await cdp.send('Emulation.setCPUThrottlingRate',{rate:p.cpu});
+              if(p.network) await cdp.send('Network.emulateNetworkConditions',p.network);
+              const failed=[],bad=[],messages=[];
+              page.on('requestfailed',r=>failed.push({url:r.url(),error:r.failure()?.errorText}));
+              page.on('response',r=>{if(r.status()>=400)bad.push({url:r.url(),status:r.status()});});
+              page.on('console',m=>{if(['warning','error'].includes(m.type()))messages.push({type:m.type(),text:m.text()});});
+              await page.addInitScript(()=>{
+                window.__audit={longTasks:[],shifts:[]};
+                try{new PerformanceObserver(l=>{for(const e of l.getEntries())window.__audit.longTasks.push({start:e.startTime,duration:e.duration});}).observe({type:'longtask',buffered:true});}catch{}
+                try{new PerformanceObserver(l=>{for(const e of l.getEntries())if(!e.hadRecentInput)window.__audit.shifts.push({start:e.startTime,value:e.value});}).observe({type:'layout-shift',buffered:true});}catch{}
+              });
+              const started=Date.now(); let navigationError=null;
+              try{await page.goto(url,{waitUntil:'domcontentloaded',timeout:60000});}catch(e){navigationError=String(e);}
+              await page.waitForTimeout(10000);
+              const canvas=page.locator('.maplibregl-canvas,.mapboxgl-canvas,canvas').first();
+              let interaction=null;
+              if(await canvas.count()){
+                const box=await canvas.boundingBox();
+                if(box){
+                  await page.evaluate(()=>{window.__frames=[];window.__running=true;let p=performance.now();const tick=t=>{if(!window.__running)return;window.__frames.push(t-p);p=t;requestAnimationFrame(tick)};requestAnimationFrame(tick)});
+                  const t0=Date.now();
+                  await page.mouse.move(box.x+box.width*.6,box.y+box.height*.55);
+                  await page.mouse.down();
+                  await page.mouse.move(box.x+box.width*.25,box.y+box.height*.4,{steps:20});
+                  await page.mouse.up();
+                  await page.mouse.wheel(0,-900);
+                  await page.waitForTimeout(4000);
+                  const frames=await page.evaluate(()=>{window.__running=false;const x=(window.__frames||[]).slice(2).sort((a,b)=>a-b);const avg=x.length?x.reduce((a,b)=>a+b,0)/x.length:null;return{samples:x.length,avg,p95:x.length?x[Math.floor(x.length*.95)]:null,fps:avg?1000/avg:null,over50:x.filter(v=>v>50).length,over100:x.filter(v=>v>100).length}});
+                  interaction={elapsed:Date.now()-t0,frames};
+                }
+              }
+              const cold=await page.evaluate(()=>{
+                const n=performance.getEntriesByType('navigation')[0];
+                const r=performance.getEntriesByType('resource');
+                return{nav:n?{ttfb:n.responseStart-n.requestStart,dcl:n.domContentLoadedEventEnd,load:n.loadEventEnd}:null,resourceCount:r.length,totalTransfer:r.reduce((s,x)=>s+(x.transferSize||0),0),heap:performance.memory?.usedJSHeapSize??null,domNodes:document.getElementsByTagName('*').length,audit:window.__audit};
+              });
+              const warmStart=Date.now();
+              await page.reload({waitUntil:'domcontentloaded',timeout:60000}).catch(()=>{});
+              await page.waitForTimeout(5000);
+              const warm={elapsed:Date.now()-warmStart,...await page.evaluate(()=>{const n=performance.getEntriesByType('navigation')[0];const r=performance.getEntriesByType('resource');return{ttfb:n?.responseStart-n?.requestStart,load:n?.loadEventEnd,totalTransfer:r.reduce((s,x)=>s+(x.transferSize||0),0),resourceCount:r.length}})};
+              output.push({profile:p.name,run,elapsed:Date.now()-started,navigationError,cold,warm,interaction,failed,bad,messages});
+              await page.screenshot({path:`reports/playwright/${p.name}-${run}.png`,fullPage:true}).catch(()=>{});
+              await context.close();
+            }
+          }
+          await browser.close();
+          fs.writeFileSync('reports/playwright/results.json',JSON.stringify(output,null,2));
+          EOF
+          node audit.mjs
+
+      - name: OWASP ZAP bounded passive baseline
+        continue-on-error: true
+        shell: bash
+        run: |
+          timeout 300s docker run --rm -v "$PWD/reports/security:/zap/wrk/:rw" \
+            ghcr.io/zaproxy/zaproxy:stable zap-baseline.py \
+            -t "$TARGET_URL" -m 3 -J zap.json -r zap.html -w zap.md || true
+
+      - name: Nuclei bounded safe scan
+        continue-on-error: true
+        shell: bash
+        run: |
+          timeout 300s docker run --rm -v "$PWD/reports/security:/output" projectdiscovery/nuclei:latest \
+            -u "$TARGET_URL" -severity low,medium,high,critical \
+            -exclude-tags fuzz,dos,intrusive,bruteforce,headless \
+            -rate-limit 8 -timeout 8 -retries 0 -jsonl-export /output/nuclei.jsonl || true
+
+      - name: Build summary
+        if: always()
+        shell: bash
+        run: |
+          cat > summarize.mjs <<'EOF'
+          import fs from 'node:fs';
+          const median=x=>{x=x.filter(Number.isFinite).sort((a,b)=>a-b);if(!x.length)return null;return x[Math.floor(x.length/2)]};
+          const lh=[];
+          for(const mode of ['mobile','desktop'])for(let run=1;run<=3;run++){
+            const p=`reports/lighthouse/${mode}-${run}.json`;if(!fs.existsSync(p))continue;
+            try{const j=JSON.parse(fs.readFileSync(p));const a=j.audits||{};lh.push({mode,run,score:(j.categories?.performance?.score??0)*100,fcp:a['first-contentful-paint']?.numericValue,lcp:a['largest-contentful-paint']?.numericValue,si:a['speed-index']?.numericValue,tbt:a['total-blocking-time']?.numericValue,cls:a['cumulative-layout-shift']?.numericValue,tti:a['interactive']?.numericValue,bytes:a['total-byte-weight']?.numericValue,requests:a['network-requests']?.details?.items?.length,mainThread:a['mainthread-work-breakdown']?.numericValue,bootup:a['bootup-time']?.numericValue,server:a['server-response-time']?.numericValue});}catch{}
+          }
+          const keys=['score','fcp','lcp','si','tbt','cls','tti','bytes','requests','mainThread','bootup','server'];
+          const summary={generatedAt:new Date().toISOString(),lighthouse:{},playwright:null,nucleiCount:0,zapAlerts:null};
+          for(const mode of ['mobile','desktop']){const g=lh.filter(x=>x.mode===mode);summary.lighthouse[mode]={runs:g.length};for(const k of keys)summary.lighthouse[mode][k]=median(g.map(x=>x[k]));}
+          if(fs.existsSync('reports/playwright/results.json'))summary.playwright=JSON.parse(fs.readFileSync('reports/playwright/results.json'));
+          if(fs.existsSync('reports/security/nuclei.jsonl'))summary.nucleiCount=fs.readFileSync('reports/security/nuclei.jsonl','utf8').split('\n').filter(Boolean).length;
+          if(fs.existsSync('reports/security/zap.json')){try{const z=JSON.parse(fs.readFileSync('reports/security/zap.json'));summary.zapAlerts=(z.site||[]).flatMap(s=>s.alerts||[]).length;}catch{}}
+          fs.writeFileSync('reports/summary.json',JSON.stringify(summary,null,2));
+          console.log(JSON.stringify(summary.lighthouse,null,2));
+          EOF
+          node summarize.mjs
+
+      - name: Upload audit artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bounded-full-map-audit
+          path: reports
+          retention-days: 5
