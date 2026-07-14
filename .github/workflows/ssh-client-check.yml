@@ -1,9 +1,9 @@
 name: SSH Client Check
 
 on:
-  push:
-    paths:
-      - .github/workflows/ssh-client-check.yml
+  pull_request:
+    branches:
+      - main
 
 permissions:
   contents: read
