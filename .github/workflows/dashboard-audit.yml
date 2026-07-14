@@ -1,0 +1,71 @@
+name: Dashboard audit
+
+on:
+  push:
+    branches:
+      - chatgpt-dashboard-audit
+
+jobs:
+  inspect-dashboard:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Check endpoint with curl
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p audit
+          curl -Lsv --connect-timeout 15 --max-time 60 \
+            -D audit/headers.txt \
+            -o audit/dashboard.html \
+            http://62.109.4.219:3000/dashboard \
+            2>audit/curl-verbose.txt
+          wc -c audit/dashboard.html
+          head -c 3000 audit/dashboard.html || true
+
+      - name: Inspect rendered page with Playwright
+        shell: bash
+        run: |
+          set -euxo pipefail
+          npm init -y
+          npm install playwright
+          npx playwright install --with-deps chromium
+          cat > inspect.mjs <<'EOF'
+          import { chromium } from 'playwright';
+          import fs from 'node:fs';
+
+          const browser = await chromium.launch({ headless: true });
+          const page = await browser.newPage({ viewport: { width: 1440, height: 1000 } });
+          const events = [];
+
+          page.on('console', msg => events.push(`[console:${msg.type()}] ${msg.text()}`));
+          page.on('pageerror', err => events.push(`[pageerror] ${err.message}`));
+          page.on('response', response => events.push(`[response] ${response.status()} ${response.url()}`));
+
+          await page.goto('http://62.109.4.219:3000/dashboard', {
+            waitUntil: 'networkidle',
+            timeout: 90000
+          });
+
+          await page.screenshot({ path: 'audit/dashboard.png', fullPage: true });
+          fs.writeFileSync('audit/rendered.html', await page.content());
+          fs.writeFileSync('audit/body.txt', await page.locator('body').innerText());
+          fs.writeFileSync('audit/browser-events.txt', events.join('\n'));
+          fs.writeFileSync('audit/metadata.json', JSON.stringify({
+            title: await page.title(),
+            url: page.url()
+          }, null, 2));
+
+          console.log(await page.locator('body').innerText());
+          await browser.close();
+          EOF
+          node inspect.mjs
+
+      - name: Upload audit artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dashboard-audit
+          path: audit/
+          if-no-files-found: warn
