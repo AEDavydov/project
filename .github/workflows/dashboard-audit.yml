@@ -1,0 +1,128 @@
+name: Dashboard audit
+
+on:
+  push:
+    branches:
+      - chatgpt-dashboard-audit
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  interaction-verification:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Install Playwright
+        shell: bash
+        run: |
+          set -euxo pipefail
+          npm init -y
+          npm install playwright
+          npx playwright install --with-deps chromium
+
+      - name: Verify interactions
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p interaction-audit
+          cat > inspect.mjs <<'EOF'
+          import { chromium } from 'playwright';
+          import fs from 'node:fs';
+
+          const browser = await chromium.launch({ headless: true });
+          const safe = async (fn, fallback = null) => { try { return await fn(); } catch { return fallback; } };
+
+          async function save(page, key, root = page) {
+            const dir = `interaction-audit/${key}`;
+            fs.mkdirSync(dir, { recursive: true });
+            const data = {
+              url: page.url(),
+              title: await safe(() => page.title(), ''),
+              text: await safe(() => root.locator('body').innerText(), ''),
+              headings: await safe(() => root.locator('h1,h2,h3,h4').allInnerTexts(), []),
+              buttons: await safe(() => root.locator('button,[role="button"],input[type="button"],input[type="submit"]').evaluateAll(nodes => nodes.map((n, index) => ({
+                index,
+                text: (n.innerText || n.value || n.textContent || '').trim(),
+                disabled: n.hasAttribute('disabled'),
+                ariaLabel: n.getAttribute('aria-label'),
+                title: n.getAttribute('title')
+              }))), []),
+              controls: await safe(() => root.locator('input,select,textarea').evaluateAll(nodes => nodes.map((n, index) => ({
+                index, tag: n.tagName, type: n.type, value: n.value, min: n.min, max: n.max, step: n.step,
+                name: n.name, placeholder: n.placeholder, ariaLabel: n.getAttribute('aria-label')
+              }))), []),
+              localStorage: await safe(() => page.evaluate(() => Object.fromEntries(Object.entries(localStorage))), {})
+            };
+            fs.writeFileSync(`${dir}/metadata.json`, JSON.stringify(data, null, 2));
+            fs.writeFileSync(`${dir}/body.txt`, data.text || '');
+            await safe(() => page.screenshot({ path: `${dir}/screenshot.png`, fullPage: true }));
+            console.log(`=== ${key} ===`);
+            console.log(JSON.stringify({ ...data, text: (data.text || '').slice(0, 18000) }, null, 2));
+          }
+
+          // ChemVerse first experiment.
+          {
+            const context = await browser.newContext({ viewport: { width: 1440, height: 1000 } });
+            const page = await context.newPage();
+            await page.goto('https://chemverse.vercel.app/', { waitUntil: 'networkidle', timeout: 90000 });
+            await page.getByRole('button', { name: /Experiment Labs/i }).click();
+            await page.waitForTimeout(1000);
+            await page.getByRole('button', { name: 'Start', exact: true }).first().click();
+            await page.waitForTimeout(2500);
+            await save(page, 'chemverse-first-experiment');
+
+            // Safety completion flow.
+            await page.goto('https://chemverse.vercel.app/', { waitUntil: 'networkidle', timeout: 90000 });
+            await page.getByRole('button', { name: /Lab Safety Training/i }).click();
+            await page.waitForTimeout(700);
+            const safetyButtons = page.locator('button').filter({ hasText: /Wear Safety Goggles|Put On Lab Gloves|Wear Lab Coat|Tie Back Long Hair|Check Bunsen Burner|Verify Ventilation/ });
+            for (let i = 0; i < await safetyButtons.count(); i++) await safetyButtons.nth(i).click();
+            await page.waitForTimeout(700);
+            await save(page, 'chemverse-safety-completed');
+
+            // Apparatus detail card.
+            await page.goto('https://chemverse.vercel.app/', { waitUntil: 'networkidle', timeout: 90000 });
+            await page.getByRole('button', { name: /Apparatus Room/i }).click();
+            await page.waitForTimeout(700);
+            await page.getByRole('button', { name: /Beaker/i }).click();
+            await page.waitForTimeout(700);
+            await save(page, 'chemverse-beaker-detail');
+            await context.close();
+          }
+
+          // ChemCollective stockroom categories.
+          {
+            const context = await browser.newContext({ viewport: { width: 1440, height: 1100 }, ignoreHTTPSErrors: true });
+            const page = await context.newPage();
+            await page.goto('https://chemcollective.org/activities/vlab/2', { waitUntil: 'domcontentloaded', timeout: 90000 });
+            await page.waitForTimeout(7000);
+            const frame = page.frame({ name: 'labframe' });
+            if (!frame) throw new Error('labframe not found');
+            const close = frame.locator('.close, button:has-text("×"), [aria-label="Close"]');
+            if (await close.count()) await close.first().click({ force: true }).catch(() => {});
+            await frame.waitForTimeout(400);
+
+            for (const tab of ['Solutions', 'Glassware', 'Tools']) {
+              const target = frame.getByText(tab, { exact: true });
+              if (await target.count()) {
+                await target.first().click({ force: true });
+                await frame.waitForTimeout(500);
+                await save(page, `chemcollective-${tab.toLowerCase()}`, frame);
+              }
+            }
+            await context.close();
+          }
+
+          await browser.close();
+          EOF
+          node inspect.mjs
+
+      - name: Upload interaction audit
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: chemistry-platform-interaction-audit
+          path: interaction-audit/
+          if-no-files-found: warn
