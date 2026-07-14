@@ -1,0 +1,51 @@
+name: Fetch Current Map Assets
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  fetch:
+    if: contains(github.event.pull_request.title, '[ASSET]')
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    env:
+      TARGET_URL: https://antiborschevik.simargl-team.ru
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download current same-origin assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p map-assets
+          curl -fsSL "$TARGET_URL/" -o map-assets/index.html
+          python3 - <<'PY'
+          import re, pathlib, urllib.parse, subprocess
+          root='https://antiborschevik.simargl-team.ru/'
+          html=pathlib.Path('map-assets/index.html').read_text(errors='replace')
+          urls=[]
+          for attr in ('src','href'):
+            urls += re.findall(rf'{attr}=["\']([^"\']+)',html,re.I)
+          seen=set()
+          for raw in urls:
+            url=urllib.parse.urljoin(root,raw)
+            if urllib.parse.urlparse(url).netloc!='antiborschevik.simargl-team.ru': continue
+            if url in seen: continue
+            seen.add(url)
+            path=urllib.parse.urlparse(url).path
+            if not path or path.endswith('/'): continue
+            name=path.strip('/').replace('/','__') or 'index'
+            print(url,'->',name)
+            subprocess.run(['curl','-fsSL',url,'-o','map-assets/'+name],check=False)
+          pathlib.Path('map-assets/urls.txt').write_text('\n'.join(sorted(seen)))
+          PY
+          find map-assets -maxdepth 1 -type f -printf '%f %s bytes\n' | sort > map-assets/files.txt
+          cat map-assets/files.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: current-map-assets
+          path: map-assets
+          retention-days: 3
