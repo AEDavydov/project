@@ -9,66 +9,124 @@ on:
       - main
 
 jobs:
-  inspect-dashboard:
+  compare-chemistry-labs:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
 
     steps:
-      - name: Check endpoint with curl
-        shell: bash
-        run: |
-          set -euxo pipefail
-          mkdir -p audit
-          curl -Lsv --connect-timeout 15 --max-time 60 \
-            -D audit/headers.txt \
-            -o audit/dashboard.html \
-            http://62.109.4.219:3000/dashboard \
-            2>audit/curl-verbose.txt
-          wc -c audit/dashboard.html
-          head -c 3000 audit/dashboard.html || true
-
-      - name: Inspect rendered page with Playwright
+      - name: Install browser tooling
         shell: bash
         run: |
           set -euxo pipefail
           npm init -y
           npm install playwright
           npx playwright install --with-deps chromium
+
+      - name: Inspect all three platforms
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p comparison
           cat > inspect.mjs <<'EOF'
           import { chromium } from 'playwright';
           import fs from 'node:fs';
 
+          const targets = [
+            { key: 'chemforge', url: 'http://62.109.4.219:3000/dashboard' },
+            { key: 'chemcollective-list', url: 'https://chemcollective.org/vlabs' },
+            { key: 'chemcollective-lab', url: 'https://chemcollective.org/activities/vlab/2' },
+            { key: 'chemverse', url: 'https://chemverse.vercel.app/' }
+          ];
+
           const browser = await chromium.launch({ headless: true });
-          const page = await browser.newPage({ viewport: { width: 1440, height: 1000 } });
-          const events = [];
 
-          page.on('console', msg => events.push(`[console:${msg.type()}] ${msg.text()}`));
-          page.on('pageerror', err => events.push(`[pageerror] ${err.message}`));
-          page.on('response', response => events.push(`[response] ${response.status()} ${response.url()}`));
+          for (const target of targets) {
+            const context = await browser.newContext({
+              viewport: { width: 1440, height: 1000 },
+              ignoreHTTPSErrors: true
+            });
+            const page = await context.newPage();
+            const events = [];
 
-          await page.goto('http://62.109.4.219:3000/dashboard', {
-            waitUntil: 'networkidle',
-            timeout: 90000
-          });
+            page.on('console', msg => events.push(`[console:${msg.type()}] ${msg.text()}`));
+            page.on('pageerror', err => events.push(`[pageerror] ${err.message}`));
+            page.on('requestfailed', req => events.push(`[requestfailed] ${req.failure()?.errorText} ${req.url()}`));
+            page.on('response', response => {
+              if (response.status() >= 400) events.push(`[response] ${response.status()} ${response.url()}`);
+            });
 
-          await page.screenshot({ path: 'audit/dashboard.png', fullPage: true });
-          fs.writeFileSync('audit/rendered.html', await page.content());
-          fs.writeFileSync('audit/body.txt', await page.locator('body').innerText());
-          fs.writeFileSync('audit/browser-events.txt', events.join('\n'));
-          fs.writeFileSync('audit/metadata.json', JSON.stringify({
-            title: await page.title(),
-            url: page.url()
-          }, null, 2));
+            let navigationError = null;
+            try {
+              await page.goto(target.url, { waitUntil: 'domcontentloaded', timeout: 90000 });
+              await page.waitForLoadState('networkidle', { timeout: 30000 }).catch(() => {});
+              await page.waitForTimeout(3000);
+            } catch (error) {
+              navigationError = String(error);
+            }
 
-          console.log(await page.locator('body').innerText());
+            const safe = async (fn, fallback) => {
+              try { return await fn(); } catch { return fallback; }
+            };
+
+            const metadata = {
+              requestedUrl: target.url,
+              finalUrl: page.url(),
+              title: await safe(() => page.title(), ''),
+              navigationError,
+              bodyText: await safe(() => page.locator('body').innerText(), ''),
+              headings: await safe(() => page.locator('h1,h2,h3').allInnerTexts(), []),
+              buttons: await safe(() => page.locator('button,[role="button"]').evaluateAll(nodes => nodes.map(n => ({
+                text: (n.innerText || n.textContent || '').trim(),
+                ariaLabel: n.getAttribute('aria-label'),
+                title: n.getAttribute('title'),
+                disabled: n.hasAttribute('disabled')
+              })).filter(x => x.text || x.ariaLabel || x.title)), []),
+              links: await safe(() => page.locator('a').evaluateAll(nodes => nodes.map(n => ({
+                text: (n.innerText || n.textContent || '').trim(),
+                href: n.href
+              })).filter(x => x.text || x.href)), []),
+              inputs: await safe(() => page.locator('input,select,textarea').evaluateAll(nodes => nodes.map(n => ({
+                tag: n.tagName,
+                type: n.getAttribute('type'),
+                name: n.getAttribute('name'),
+                placeholder: n.getAttribute('placeholder'),
+                ariaLabel: n.getAttribute('aria-label')
+              }))), []),
+              frames: page.frames().map(frame => ({ name: frame.name(), url: frame.url() })),
+              localStorage: await safe(() => page.evaluate(() => Object.fromEntries(Object.entries(localStorage))), {}),
+              sessionStorage: await safe(() => page.evaluate(() => Object.fromEntries(Object.entries(sessionStorage))), {})
+            };
+
+            fs.mkdirSync(`comparison/${target.key}`, { recursive: true });
+            fs.writeFileSync(`comparison/${target.key}/metadata.json`, JSON.stringify(metadata, null, 2));
+            fs.writeFileSync(`comparison/${target.key}/body.txt`, metadata.bodyText);
+            fs.writeFileSync(`comparison/${target.key}/events.txt`, events.join('\n'));
+            fs.writeFileSync(`comparison/${target.key}/page.html`, await safe(() => page.content(), ''));
+            await safe(() => page.screenshot({ path: `comparison/${target.key}/screenshot.png`, fullPage: true }), null);
+
+            console.log(`=== ${target.key} ===`);
+            console.log(JSON.stringify({
+              title: metadata.title,
+              finalUrl: metadata.finalUrl,
+              headings: metadata.headings,
+              buttons: metadata.buttons.slice(0, 80),
+              links: metadata.links.slice(0, 80),
+              inputs: metadata.inputs,
+              frames: metadata.frames,
+              bodyPreview: metadata.bodyText.slice(0, 12000)
+            }, null, 2));
+
+            await context.close();
+          }
+
           await browser.close();
           EOF
           node inspect.mjs
 
-      - name: Upload audit artifact
+      - name: Upload comparison artifact
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: dashboard-audit
-          path: audit/
+          name: chemistry-platform-comparison
+          path: comparison/
           if-no-files-found: warn
